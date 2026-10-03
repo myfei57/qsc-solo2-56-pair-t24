@@ -2,6 +2,11 @@
 
 同一列车的门控指令按提交顺序排队；发车时先把"已发车"落盘，再清空队列。先落盘
 再清空保证：即使清空过程中掉电，重启后也能看到该车已经发过车，不会重放指令。
+
+格式迁移期间（``dual`` 阶段）入队由
+:class:`psdline.store.commands.CommandLog` 按列车当前格式路由：未迁移的车
+第一次入队即把整车在办队列无损切到 v2，迁完的车直接写 v2；归档文档永不参与
+清空。
 """
 
 from __future__ import annotations
@@ -20,18 +25,14 @@ def enqueue(
     command_id: str,
     kind: str,
     station_id: str,
+    *,
+    at: float | None = None,
 ) -> DoorCommand:
-    """把一条门控指令排进列车队列。"""
+    """把一条门控指令排进列车队列（格式随迁移状态自动路由）。"""
 
-    command = DoorCommand(
-        id=command_id,
-        train_id=train_id,
-        kind=kind,
-        epoch=controller.commands.epoch,
-        station_id=station_id,
+    return controller.commands.submit(
+        train_id, command_id, kind, station_id, at=at
     )
-    controller.commands.append(command)
-    return command
 
 
 def process_queue(controller: DoorController, train_id: str) -> list[str]:

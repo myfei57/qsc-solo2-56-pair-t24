@@ -71,6 +71,13 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/store", self._store)
+        add("GET", "/api/migration", self._migration_status)
+        add("POST", "/api/migration/begin", self._migration_begin)
+        add("POST", "/api/migration/migrate-train", self._migration_migrate_train)
+        add("POST", "/api/migration/migrate-all", self._migration_migrate_all)
+        add("POST", "/api/migration/finish", self._migration_finish)
+        add("POST", "/api/migration/rollback", self._migration_rollback)
+        add("GET", "/api/migration/verify", self._migration_verify)
         add("GET", "/api/mapping/{stationID}", self._mapping)
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
@@ -162,6 +169,29 @@ class Api:
             "summary": self._platform.metrics.summary(),
             "documents": self._platform.store.list_ids(),
         }
+
+    # ---- 门控指令格式迁移 --------------------------------------------
+
+    def _migration_status(self, params: dict, body: dict) -> dict:
+        return self._platform.migration_status()
+
+    def _migration_begin(self, params: dict, body: dict) -> dict:
+        return self._platform.migration_begin()
+
+    def _migration_migrate_train(self, params: dict, body: dict) -> dict:
+        return self._platform.migrate_train(_require(body, "train_id"))
+
+    def _migration_migrate_all(self, params: dict, body: dict) -> dict:
+        return self._platform.migrate_all_trains()
+
+    def _migration_finish(self, params: dict, body: dict) -> dict:
+        return self._platform.migration_finish()
+
+    def _migration_rollback(self, params: dict, body: dict) -> dict:
+        return self._platform.migration_rollback()
+
+    def _migration_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.migration_verify()
 
     def _mapping(self, params: dict, body: dict) -> dict:
         station_id = str(params.get("stationID", ""))

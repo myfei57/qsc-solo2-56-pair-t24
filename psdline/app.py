@@ -58,7 +58,16 @@ from .station import (
     nearest_zone,
     spread_m,
 )
-from .store import CommandLog, JsonStore, JsonlJournal, StoreMetrics
+from .store import (
+    DONE,
+    DUAL,
+    LEGACY,
+    CommandLog,
+    JsonStore,
+    JsonlJournal,
+    MigrationCoordinator,
+    StoreMetrics,
+)
 from .telemetry import TrendBuffer
 from .train import (
     AlignRegistry,
@@ -128,7 +137,8 @@ class Platform:
         self.mappings = MappingRegistry(store)
         self.gaps = GapRegistry(store)
         self.quotas = QuotaRegistry(store)
-        self.commands = CommandLog(store)
+        self.migrator = MigrationCoordinator(store, clock=self.clock)
+        self.commands = CommandLog(store, migration=self.migrator, clock=self.clock)
         self.doors = DoorController(
             store, self.align, self.commands, self.gates, self.lockouts
         )
@@ -213,13 +223,23 @@ class Platform:
         )
 
     def _restore(self) -> None:
-        """从落盘状态恢复操作计数与锁定状态。"""
+        """从落盘状态恢复操作计数、锁定状态与迁移中途现场。"""
 
         state = self.store.read("platform/state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        # 格式升级允许服务带着迁到一半的现场重启：启动即收敛，不丢在办指令。
+        recovery = self.migrator.recover()
+        if recovery["repaired"] or recovery["left_legacy"]:
+            self.audit.record(
+                "command_migration_recover",
+                "",
+                "",
+                repaired=list(recovery["repaired"]),
+                left_legacy=list(recovery["left_legacy"]),
+            )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -551,11 +571,114 @@ class Platform:
     def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "") -> dict:
         """把一条门控指令排进队列。"""
 
-        command = enqueue(self.doors, train_id, command_id, kind, station_id)
+        command = enqueue(
+            self.doors,
+            train_id,
+            command_id,
+            kind,
+            station_id,
+            at=self.clock.now(),
+        )
         self.audit.record(
-            "door_enqueue", train_id, station_id, command_id=command.id, command_kind=kind
+            "door_enqueue",
+            train_id,
+            station_id,
+            command_id=command.id,
+            command_kind=kind,
+            command_format=f"v{command.ver}",
         )
         return {"ok": True, "train_id": train_id, "command": command.as_dict(), "violations": []}
+
+    # ---- 门控指令格式迁移 --------------------------------------------
+
+    def migration_status(self) -> dict:
+        """返回门控指令格式迁移的当前进度（阶段、逐车状态、能否切换）。"""
+
+        return self.migrator.status()
+
+    def migration_begin(self) -> dict:
+        """开启并存阶段：此后新入队按车路由到 v2，旧 v1 队列照常能读能执行。"""
+
+        status = self.migrator.begin(at=self.clock.now())
+        self.audit.record(
+            "command_migration_begin",
+            "",
+            "",
+            format_from=status["format_from"],
+            format_to=status["format_to"],
+            generation=status["generation"],
+        )
+        return {"ok": True, **status}
+
+    def migrate_train(self, train_id: str) -> dict:
+        """迁移一列车的在办队列（幂等，可重放）。"""
+
+        outcome = self.migrator.migrate_train(train_id)
+        self.audit.record(
+            "command_migrate_train",
+            train_id,
+            "",
+            state=outcome.get("state", "migrated"),
+            count=int(outcome.get("count", 0)),
+            archive=str(outcome.get("archive", "")),
+        )
+        return {"ok": True, **outcome, **self._migration_progress()}
+
+    def migrate_all_trains(self) -> dict:
+        """迁移所有还挂着 v1 活动文档的列车；单车失败不阻塞其他车。"""
+
+        outcome = self.migrator.migrate_all()
+        failed = [
+            train_id
+            for train_id, result in outcome.get("results", {}).items()
+            if result.get("state") == "failed"
+        ]
+        self.audit.record(
+            "command_migrate_all",
+            "",
+            "",
+            attempted=len(outcome.get("results", {})),
+            failed=failed,
+            migrated=outcome.get("trains_migrated", 0),
+            total=outcome.get("trains_total", 0),
+        )
+        return {"ok": not failed, **outcome}
+
+    def migration_finish(self) -> dict:
+        """切到 v2-only：要求无在办／未迁列车，且磁盘上不剩 v1 活动文档。"""
+
+        status = self.migrator.finish(at=self.clock.now())
+        verification = self.migrator.verify()
+        self.audit.record(
+            "command_migration_finish",
+            "",
+            "",
+            phase=status["phase"],
+            verify_ok=bool(verification["ok"]),
+            findings=list(verification["findings"]),
+        )
+        return {"ok": True, **status, "verification": verification}
+
+    def migration_rollback(self) -> dict:
+        """并存阶段整体回滚到 v1（归档保留不动）；迁完不可回滚。"""
+
+        status = self.migrator.rollback()
+        self.audit.record("command_migration_rollback", "", "", phase=status["phase"])
+        return {"ok": True, **status}
+
+    def migration_verify(self) -> dict:
+        """只读巡检：v2 逐条摘要、信封摘要、归档字节摘要是否全部自洽。"""
+
+        return self.migrator.verify()
+
+    def _migration_progress(self) -> dict:
+        status = self.migrator.status()
+        return {
+            "phase": status["phase"],
+            "trains_migrated": status["trains_migrated"],
+            "trains_total": status["trains_total"],
+            "progress_percent": status["progress_percent"],
+        }
 
     def process_queue(self, train_id: str) -> dict:
         """返回列车队列里待执行的门控指令，并带上发车自检结果。"""
@@ -748,6 +871,7 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "command_migration": self.migrator.status(),
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }

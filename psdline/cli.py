@@ -182,6 +182,26 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_migration(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    actions = {
+        "status": platform.migration_status,
+        "begin": platform.migration_begin,
+        "migrate-all": platform.migrate_all_trains,
+        "finish": platform.migration_finish,
+        "rollback": platform.migration_rollback,
+        "verify": platform.migration_verify,
+    }
+    if args.action == "train":
+        payload = platform.migrate_train(args.train)
+    else:
+        payload = actions[args.action]()
+    _dump(payload)
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +236,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    migration = sub.add_parser(
+        "migration", help="门控指令格式迁移（status/begin/train/migrate-all/finish/rollback/verify）", parents=[common]
+    )
+    migration.add_argument(
+        "action",
+        choices=("status", "begin", "train", "migrate-all", "finish", "rollback", "verify"),
+    )
+    migration.add_argument("--train", default="", help="action=train 时指定列车标识")
+    migration.set_defaults(func=_cmd_migration)
     return parser
 
 

@@ -80,6 +80,40 @@ class JsonStore:
             except (OSError, json.JSONDecodeError) as error:
                 raise StorageError(f"读取文档 {doc_id} 失败: {error}", component="store") from error
 
+    def copy_file(self, src_id: str, dst_id: str) -> str:
+        """把一个文档的原始字节原样复制到另一个文档标识，返回目标路径。
+
+        归档要求"旧格式文档一个字节都不变"，因此不走 JSON 反序列化／重排，
+        而是按字节复制并用临时文件 + ``os.replace`` 原子落盘。源不存在时抛
+        :class:`StorageError`，由调用方先判断要不要归档。
+        """
+
+        source = self.path_of(src_id)
+        target = self.path_of(dst_id)
+        directory = os.path.dirname(target)
+        with self._lock:
+            if not os.path.isfile(source):
+                raise StorageError(f"源文档不存在: {src_id}", component="store")
+            try:
+                with open(source, "rb") as handle:
+                    payload = handle.read()
+                os.makedirs(directory, exist_ok=True)
+                handle = tempfile.NamedTemporaryFile(
+                    "wb",
+                    dir=directory,
+                    prefix=".copy.",
+                    suffix=".tmp",
+                    delete=False,
+                )
+                with handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(handle.name, target)
+            except OSError as error:
+                raise StorageError(f"复制文档 {src_id} 失败: {error}", component="store") from error
+        return target
+
     def remove(self, doc_id: str) -> bool:
         """删除一个文档，返回是否真的删掉了文件。"""
 
