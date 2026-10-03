@@ -43,6 +43,10 @@ class StorageError(RailError):
     """持久化读写失败。"""
 
 
+class MigrationBusyError(RailError):
+    """迁移边界暂时未到，调用方应在安全边界后重试。"""
+
+
 class ConfigError(RailError):
     """配置缺失或取值非法。"""
 

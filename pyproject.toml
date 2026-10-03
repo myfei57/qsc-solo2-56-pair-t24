@@ -26,4 +26,5 @@ packages = [
     "psdline.quota",
     "psdline.audit",
     "psdline.console",
+    "psdline.migration",
 ]

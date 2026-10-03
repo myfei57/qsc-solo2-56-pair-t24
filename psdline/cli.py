@@ -182,6 +182,24 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_command_migration(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    if args.migration_action == "status":
+        payload = platform.command_migration_status()
+    elif args.migration_action == "begin":
+        payload = platform.begin_command_migration(args.trains or None)
+    elif args.migration_action == "next":
+        payload = platform.migrate_commands_next(allow_queued=args.allow_queued)
+    elif args.migration_action == "train":
+        if not args.train:
+            raise RailError("迁移单列车时必须提供 --train", component="console")
+        payload = platform.migrate_commands(args.train, allow_queued=args.allow_queued)
+    else:
+        payload = platform.finish_command_migration()
+    _dump(payload)
+    return 0 if payload.get("ok", True) else 3
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +234,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    migration = sub.add_parser("command-migration", help="查看或推进门控指令格式迁移", parents=[common])
+    migration.add_argument(
+        "migration_action",
+        choices=("status", "begin", "next", "train", "finish"),
+    )
+    migration.add_argument("--train", default="", help="要迁移的列车标识")
+    migration.add_argument("--trains", nargs="*", help="begin 时显式指定列车")
+    migration.add_argument("--allow-queued", action="store_true", help="允许在队列非空时转换")
+    migration.set_defaults(func=_cmd_command_migration)
     return parser
 
 

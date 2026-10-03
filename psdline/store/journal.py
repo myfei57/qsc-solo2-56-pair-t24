@@ -7,10 +7,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - 当前交付目标是 Linux
+    fcntl = None  # type: ignore[assignment]
 
 from ..errors import StorageError
 
@@ -44,26 +50,51 @@ class JsonlJournal:
             path = self._segment_path(index)
             if not os.path.isfile(path):
                 break
-            with open(path, "r", encoding="utf-8") as handle:
-                total += sum(1 for line in handle if line.strip())
+            total += len(self._read_file(path))
         return total
 
-    def append(self, record: Any) -> str:
-        """追加一条记录，返回写入的段路径。"""
+    @staticmethod
+    def _encode(record: Any) -> str:
+        body = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        checksum = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        envelope = {"sha256": checksum, "record": json.loads(body)}
+        return json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
 
+    @staticmethod
+    def _decode(line: str) -> dict:
+        item = json.loads(line)
+        if not isinstance(item, dict) or "record" not in item:
+            # 兼容升级前已存在的裸 JSONL 审计记录。
+            return item if isinstance(item, dict) else {"record": item}
+        record = item["record"]
+        body = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        actual = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        if item.get("sha256") != actual:
+            raise ValueError("流水校验和不匹配")
+        return record if isinstance(record, dict) else {"record": record}
+
+    def append(self, record: Any) -> str:
+        """原子追加一条记录，返回写入的段路径。"""
+
+        line = self._encode(record) + "\n"
+        lock_path = os.path.join(self._root, f".{self._topic}.journal.lock")
         with self._lock:
-            index = self._count // self._segment_limit
-            path = self._segment_path(index)
-            try:
-                with open(path, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except OSError as error:
-                raise StorageError(f"追加流水失败: {error}", component="store") from error
-            self._count += 1
-            self._segment = index
-            return path
+            os.makedirs(self._root, exist_ok=True)
+            with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+                if fcntl is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                index = self._count // self._segment_limit
+                path = self._segment_path(index)
+                try:
+                    with open(path, "a", encoding="utf-8") as handle:
+                        handle.write(line)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except OSError as error:
+                    raise StorageError(f"追加流水失败: {error}", component="store") from error
+                self._count += 1
+                self._segment = index
+                return path
 
     def segments(self) -> list[str]:
         """返回已存在的段文件路径（按段号升序）。"""
@@ -105,8 +136,28 @@ class JsonlJournal:
             return self._segment
 
     def _read_file(self, path: str) -> list[dict]:
+        records: list[dict] = []
+        corrupt: list[str] = []
         try:
             with open(path, "r", encoding="utf-8") as handle:
-                return [json.loads(line) for line in handle if line.strip()]
-        except (OSError, json.JSONDecodeError) as error:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        item = self._decode(line)
+                    except (json.JSONDecodeError, ValueError) as error:
+                        corrupt.append(f"{line_number}:{error}:{line.rstrip()}")
+                        continue
+                    records.append(item)
+        except OSError as error:
             raise StorageError(f"读取流水 {path} 失败: {error}", component="store") from error
+        if corrupt:
+            quarantine = path + ".corrupt"
+            try:
+                with open(quarantine, "a", encoding="utf-8") as handle:
+                    for item in corrupt:
+                        handle.write(item + "\n")
+            except OSError:
+                pass
+            raise StorageError(f"流水 {path} 存在损坏记录，已隔离至 {quarantine}", component="store")
+        return records

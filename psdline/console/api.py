@@ -71,6 +71,11 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/store", self._store)
+        add("GET", "/api/command-migration", self._command_migration_status)
+        add("POST", "/api/command-migration/begin", self._command_migration_begin)
+        add("POST", "/api/command-migration/next", self._command_migration_next)
+        add("POST", "/api/command-migration/train", self._command_migration_train)
+        add("POST", "/api/command-migration/finish", self._command_migration_finish)
         add("GET", "/api/mapping/{stationID}", self._mapping)
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
@@ -162,6 +167,30 @@ class Api:
             "summary": self._platform.metrics.summary(),
             "documents": self._platform.store.list_ids(),
         }
+
+    def _command_migration_status(self, params: dict, body: dict) -> dict:
+        return self._platform.command_migration_status()
+
+    def _command_migration_begin(self, params: dict, body: dict) -> dict:
+        train_ids = body.get("train_ids")
+        if train_ids is not None and not isinstance(train_ids, list):
+            raise RailError("train_ids 必须是数组", component="console")
+        ids = [str(item) for item in train_ids] if isinstance(train_ids, list) else None
+        return self._platform.begin_command_migration(ids)
+
+    def _command_migration_next(self, params: dict, body: dict) -> dict:
+        return self._platform.migrate_commands_next(
+            allow_queued=bool(body.get("allow_queued", False))
+        )
+
+    def _command_migration_train(self, params: dict, body: dict) -> dict:
+        return self._platform.migrate_commands(
+            _require(body, "train_id"),
+            allow_queued=bool(body.get("allow_queued", False)),
+        )
+
+    def _command_migration_finish(self, params: dict, body: dict) -> dict:
+        return self._platform.finish_command_migration()
 
     def _mapping(self, params: dict, body: dict) -> dict:
         station_id = str(params.get("stationID", ""))

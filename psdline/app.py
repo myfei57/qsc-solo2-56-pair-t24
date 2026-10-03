@@ -42,6 +42,7 @@ from .interlock import (
     restore_lockouts,
     verdict_of,
 )
+from .migration import CommandMigrator
 from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
@@ -128,9 +129,20 @@ class Platform:
         self.mappings = MappingRegistry(store)
         self.gaps = GapRegistry(store)
         self.quotas = QuotaRegistry(store)
+        self.command_migrations = CommandMigrator(
+            store,
+            clock=self.clock.now,
+            audit=self.audit,
+            owner=self.unit,
+        )
         self.commands = CommandLog(store)
         self.doors = DoorController(
-            store, self.align, self.commands, self.gates, self.lockouts
+            store,
+            self.align,
+            self.commands,
+            self.gates,
+            self.lockouts,
+            on_depart=self._on_commands_departed,
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
 
@@ -220,6 +232,7 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        self.command_migrations.recover([train.id for train in self.trains.list()])
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -551,11 +564,52 @@ class Platform:
     def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "") -> dict:
         """把一条门控指令排进队列。"""
 
-        command = enqueue(self.doors, train_id, command_id, kind, station_id)
+        command = enqueue(
+            self.doors, train_id, command_id, kind, station_id, at=self.clock.now()
+        )
         self.audit.record(
             "door_enqueue", train_id, station_id, command_id=command.id, command_kind=kind
         )
         return {"ok": True, "train_id": train_id, "command": command.as_dict(), "violations": []}
+
+    def begin_command_migration(self, train_ids: list[str] | None = None) -> dict:
+        """打开门控指令双格式迁移窗口。"""
+
+        ids = list(train_ids or [train.id for train in self.trains.list()])
+        return self.command_migrations.begin(ids)
+
+    def migrate_commands(self, train_id: str, *, allow_queued: bool = False) -> dict:
+        """迁移一列车的门控指令；在办指令默认等发车清队后完成。"""
+
+        result = self.command_migrations.migrate_train(train_id, allow_queued=allow_queued)
+        migrated = result.get("state") == "v2"
+        result["ok"] = migrated
+        result["violations"] = [] if migrated else ["waiting_safe_boundary"]
+        return result
+
+    def migrate_commands_next(self, *, allow_queued: bool = False) -> dict:
+        """推进下一列车的门控指令迁移。"""
+
+        result = self.command_migrations.migrate_next(
+            [train.id for train in self.trains.list()], allow_queued=allow_queued
+        )
+        if result is None:
+            return {"ok": True, "done": True, "violations": []}
+        result["ok"] = result["state"] == "v2"
+        result["done"] = False
+        result["violations"] = [] if result["ok"] else ["waiting_safe_boundary"]
+        return result
+
+    def finish_command_migration(self) -> dict:
+        """全部列车切到 v2 后关闭旧格式执行窗口。"""
+
+        result = self.command_migrations.finish()
+        return {"ok": True, **result, "violations": []}
+
+    def command_migration_status(self) -> dict:
+        """查看门控指令格式迁移进度。"""
+
+        return self.command_migrations.status([train.id for train in self.trains.list()])
 
     def process_queue(self, train_id: str) -> dict:
         """返回列车队列里待执行的门控指令，并带上发车自检结果。"""
@@ -748,6 +802,7 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "command_migration": self.command_migration_status(),
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }
@@ -842,6 +897,15 @@ class Platform:
         return self.store.remove("platform/state")
 
     # ---- 内部 ---------------------------------------------------------
+
+    def _on_commands_departed(self, train_id: str, at: float, cleared: int) -> dict | None:
+        state = self.command_migrations.train_status(train_id)
+        if state["state"] == "v2":
+            return state
+        if state["state"] != "waiting_boundary":
+            return None
+        result = self.command_migrations.migrate_train(train_id)
+        return result if result.get("state") == "v2" else None
 
     def _stop_position(self, station_id: str) -> int:
         """返回站台的停稳位置（取最近门区里程）。"""

@@ -20,15 +20,20 @@ def enqueue(
     command_id: str,
     kind: str,
     station_id: str,
+    at: float | None = None,
 ) -> DoorCommand:
     """把一条门控指令排进列车队列。"""
 
+    target_format = controller.commands.format_version(train_id)
     command = DoorCommand(
         id=command_id,
         train_id=train_id,
         kind=kind,
         epoch=controller.commands.epoch,
         station_id=station_id,
+        schema_version=target_format,
+        issued_at=at,
+        idempotency_key=command_id,
     )
     controller.commands.append(command)
     return command
@@ -47,7 +52,13 @@ def depart(controller: DoorController, train_id: str, at: float) -> dict:
 
     controller.store.write(departed_doc_id(train_id), {"train_id": train_id, "at": at})
     cleared = controller.commands.clear(train_id)
-    return {"train_id": train_id, "departed": True, "cleared_commands": cleared}
+    migration = controller.depart_hook(train_id, at, cleared)
+    return {
+        "train_id": train_id,
+        "departed": True,
+        "cleared_commands": cleared,
+        "command_migration": migration,
+    }
 
 
 def departed(controller: DoorController, train_id: str) -> bool:

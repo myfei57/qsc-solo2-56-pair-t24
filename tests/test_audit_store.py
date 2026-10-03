@@ -15,7 +15,9 @@ from psdline.audit import (
 )
 from psdline.clock import ManualClock
 from psdline.eventbus import Event, EventBus
+from psdline.migration import CommandMigrator
 from psdline.store import CommandLog, DoorCommand, JsonStore, JsonlJournal, StoreMetrics
+from psdline.store.commands import COMMAND_FORMAT_V2, envelope_v2, parse_command_document
 
 
 def _log(tmp_path) -> tuple[AuditLog, EventBus, ManualClock]:
@@ -104,6 +106,96 @@ def test_command_log_queue(tmp_path):
     assert log.clear("T01") == 2
     assert log.epoch == 1
     assert log.pending("T01") == []
+
+
+def test_command_log_v2_roundtrip(tmp_path):
+    store = JsonStore(str(tmp_path))
+    log = CommandLog(store)
+    store.write(
+        "migration/commands/T02/state",
+        {"train_id": "T02", "state": "v2", "format": COMMAND_FORMAT_V2},
+    )
+    command = DoorCommand(
+        id="c1",
+        train_id="T02",
+        kind="open",
+        epoch=log.epoch,
+        station_id="ST1",
+        schema_version=COMMAND_FORMAT_V2,
+        issued_at=1.0,
+        idempotency_key="c1",
+    )
+    log.append(command)
+    raw = store.read("commands/T02")
+    assert raw["schema_version"] == COMMAND_FORMAT_V2
+    assert raw["count"] == 1
+    assert log.ids("T02") == ["c1"]
+    assert log.pending("T02")[0].sequence == 1
+
+
+def test_command_migrator_waits_then_switches_after_boundary(tmp_path):
+    store = JsonStore(str(tmp_path))
+    clock = ManualClock()
+    audit_root = tmp_path / "audit"
+    audit = AuditLog(clock, EventBus(), JsonlJournal(str(audit_root), "audit"))
+    migrator = CommandMigrator(store, clock=clock.now, audit=audit)
+    migrator.begin(["T01"])
+    log = CommandLog(store)
+    log.append(DoorCommand(id="c1", train_id="T01", kind="open", epoch=0))
+
+    waiting = migrator.migrate_train("T01")
+    assert waiting["state"] == "waiting_boundary"
+    assert migrator.status()["waiting_boundary"] == ["T01"]
+
+    assert log.clear("T01") == 1
+    done = migrator.migrate_train("T01")
+    assert done["state"] == "v2"
+    commands, version, epoch = parse_command_document(store.read("commands/T01"))
+    assert commands == [] and version == COMMAND_FORMAT_V2 and epoch == 1
+    assert migrator.status()["legacy_documents"] == []
+    assert migrator.finish()["phase"] == "finished"
+    audit_kinds = [entry.kind for entry in audit.replay()]
+    assert "command_migration_begin" in audit_kinds
+    assert "command_migration_complete" in audit_kinds
+
+
+def test_command_migrator_archives_queued_commands_when_forced(tmp_path):
+    store = JsonStore(str(tmp_path))
+    migrator = CommandMigrator(store, clock=ManualClock().now)
+    migrator.begin(["T01"])
+    log = CommandLog(store)
+    log.append(DoorCommand(id="c1", train_id="T01", kind="open", epoch=0, station_id="ST1"))
+
+    result = migrator.migrate_train("T01", allow_queued=True)
+    assert result["state"] == "v2" and result["converted"] == 1
+    raw = store.read("commands/T01")
+    assert raw["schema_version"] == COMMAND_FORMAT_V2
+    assert raw["commands"][0]["id"] == "c1"
+    archive = store.read(result["archive_doc"])
+    assert archive["payload"] == [
+        {"id": "c1", "train_id": "T01", "kind": "open", "epoch": 0, "station_id": "ST1"}
+    ]
+
+
+def test_command_migrator_recovers_half_finished_state(tmp_path):
+    store = JsonStore(str(tmp_path))
+    migrator = CommandMigrator(store, clock=ManualClock().now)
+    migrator.begin(["T01"])
+    log = CommandLog(store)
+    log.append(DoorCommand(id="c1", train_id="T01", kind="open", epoch=0))
+    done = migrator.migrate_train("T01", allow_queued=True)
+
+    archive = store.read(done["archive_doc"])
+    store.write("commands/T01", archive["payload"])
+    state = store.read("migration/commands/T01/state")
+    state["state"] = "migrating"
+    state["lease_expires_at"] = 0
+    store.write("migration/commands/T01/state", state)
+
+    recovered = CommandMigrator(store, clock=ManualClock().now)
+    results = recovered.recover()
+    assert results[0]["state"] == "v2"
+    assert parse_command_document(store.read("commands/T01"))[1] == COMMAND_FORMAT_V2
 
 
 def test_store_metrics_summarises(tmp_path):

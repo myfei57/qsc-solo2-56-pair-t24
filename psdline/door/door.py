@@ -17,12 +17,14 @@ class DoorController:
         commands: CommandLog,
         gates: PSDRegistry,
         lockouts: LockoutRegistry,
+        on_depart: object | None = None,
     ) -> None:
         self._store = store
         self._align = align
         self._commands = commands
         self._gates = gates
         self._lockouts = lockouts
+        self._on_depart = on_depart
         self._batch_limit = 64
         self._opens = 0
         self._closes = 0
@@ -46,6 +48,11 @@ class DoorController:
     @property
     def lockouts(self) -> LockoutRegistry:
         return self._lockouts
+
+    def depart_hook(self, train_id: str, at: float, cleared: int) -> dict | None:
+        if self._on_depart is None:
+            return None
+        return self._on_depart(train_id, at, cleared)
 
     @property
     def opens(self) -> int:

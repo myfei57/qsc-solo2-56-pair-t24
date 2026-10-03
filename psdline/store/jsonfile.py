@@ -63,9 +63,22 @@ class JsonStore:
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(handle.name, target)
+                self._fsync_directory(directory)
             except OSError as error:
                 raise StorageError(f"写入文档 {doc_id} 失败: {error}", component="store") from error
         return target
+
+    @staticmethod
+    def _fsync_directory(directory: str) -> None:
+        try:
+            dirfd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        except OSError:
+            # 文件系统不支持目录 fsync 时不阻断主流程；文件内容本身已 fsync。
+            pass
 
     def read(self, doc_id: str) -> Any | None:
         """读取一个文档，不存在时返回 ``None``。"""
@@ -88,6 +101,7 @@ class JsonStore:
             if not os.path.isfile(target):
                 return False
             os.remove(target)
+            self._fsync_directory(os.path.dirname(target))
             return True
 
     def list_ids(self) -> list[str]:
